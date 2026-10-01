@@ -29,6 +29,10 @@ class QuestionWithSource(Question):
 
 # ---------- config ----------
 
+GEMINI_CLIENT = genai.Client(
+    api_key=os.environ["GEMINI_API_KEY"]
+)
+
 DIFFICULTY_LEVELS = {
     "easy": "primary school level",
     "medium": "high school level",
@@ -88,9 +92,8 @@ def read_json(environ):
         return None
     return data if isinstance(data, dict) else None
 
-
 def get_client():
-    return genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    return GEMINI_CLIENT
 
 
 def get_model():
@@ -193,7 +196,9 @@ def handle_generate(environ, start_response):
         )
 
     try:
-        response = get_client().models.generate_content(
+        client = get_client()
+
+        response = client.models.generate_content(
             model=get_model(),
             contents=[file_part, prompt] if file_part else prompt,
             config=types.GenerateContentConfig(
@@ -203,6 +208,7 @@ def handle_generate(environ, start_response):
                 response_schema=list[QuestionWithSource] if file_part else list[Question],
             ),
         )
+        
         questions = [normalize_source(q) for q in json.loads(response.text)]
         return respond(start_response, 200, normalize_categories(questions))
     except Exception as e:
