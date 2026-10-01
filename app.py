@@ -21,6 +21,7 @@ class Question(TypedDict):
     options: list[str]
     correct_index: int
     category: str
+    explanation: str  # 1-2 sentences on why the correct option is right
 
 
 class QuestionWithSource(Question):
@@ -50,6 +51,8 @@ ALLOWED_MIME_TYPES = {
 }
 # Vercel rejects request bodies over ~4.5 MB, and base64 adds ~33%
 MAX_FILE_BYTES = 3 * 1024 * 1024
+# Pasted-text grounding is embedded in the prompt; cap it to bound cost
+MAX_SOURCE_TEXT_CHARS = 12000
 MAX_ANALYZE_QUESTIONS = 50
 
 # A category scoring below this percentage counts as a weakness
@@ -101,19 +104,36 @@ def get_model():
 
 
 def normalize_source(question):
-    """Turn the model's source into null when it isn't backed by the file."""
+    """Flatten the model's source dict into a display string, or null.
+
+    Clients render `source` as a plain excerpt string ("p.2, l.5: ..."),
+    so a dict must never leak into the response. Null when the question
+    isn't backed by the file/text (empty excerpt).
+    """
     src = question.get("source")
     if not isinstance(src, dict):
         question["source"] = None
         return question
-    page = src.get("page") or None
-    line = src.get("line") or None
+    page = src.get("page") or 0
+    line = src.get("line") or 0
     excerpt = str(src.get("excerpt") or "").strip()
-    question["source"] = (
-        {"page": page, "line": line, "excerpt": excerpt}
-        if excerpt or page or line
-        else None
-    )
+    if not excerpt:
+        question["source"] = None
+        return question
+    bits = []
+    if page:
+        bits.append(f"p.{page}")
+    if line:
+        bits.append(f"l.{line}")
+    location = ", ".join(bits)
+    question["source"] = f"{location}: {excerpt}" if location else excerpt
+    return question
+
+
+def normalize_explanation(question):
+    """Trim the model's explanation; null when it sent nothing usable."""
+    explanation = str(question.get("explanation") or "").strip()
+    question["explanation"] = explanation or None
     return question
 
 
@@ -150,11 +170,14 @@ def handle_generate(environ, start_response):
     if not 1 <= count <= 20:
         return respond(start_response, 400, {"error": "Count must be between 1 and 20"})
 
-    # optional file
+    # optional file (Flutter sends fileData/mimeType; legacy web sends
+    # file/file_mime_type — accept both, Flutter names win)
     file_part = None
-    file_b64 = data.get("file")
+    file_b64 = data.get("fileData") or data.get("file")
     if file_b64:
-        mime_type = str(data.get("file_mime_type", "")).lower()
+        mime_type = str(
+            data.get("mimeType") or data.get("file_mime_type") or ""
+        ).lower()
         if mime_type not in ALLOWED_MIME_TYPES:
             return respond(start_response, 400, {"error": "Unsupported file type"})
         try:
@@ -165,10 +188,22 @@ def handle_generate(environ, start_response):
             return respond(start_response, 400, {"error": "File too large (max 3 MB)"})
         file_part = types.Part.from_bytes(data=file_bytes, mime_type=mime_type)
 
+    # optional pasted text (Flutter `sourceText`); file wins when both sent
+    source_text = data.get("sourceText")
+    if not isinstance(source_text, str) or not source_text.strip():
+        source_text = None
+    else:
+        source_text = source_text.strip()[:MAX_SOURCE_TEXT_CHARS]
+    if file_part:
+        source_text = None
+    grounded = file_part is not None or source_text is not None
+
     prompt = (
         f'Generate exactly {count} multiple-choice questions about "{topic.strip()}" '
         f"({difficulty_description}). Each question must have exactly 4 options, "
-        "and correct_index is the 0-based index of the correct option.\n\n"
+        "and correct_index is the 0-based index of the correct option. "
+        "Each question must also have an explanation: 1-2 sentences explaining "
+        "why the correct option is right.\n\n"
         "Categorization rules (the quiz results are grouped by category, so follow "
         "these strictly):\n"
         "- Every question must have a category: a short subtopic label of 1-3 words "
@@ -195,6 +230,18 @@ def handle_generate(environ, start_response):
             "the file, use page 0, line 0 and an empty excerpt. Never invent quotes."
         )
 
+    if source_text is not None:
+        prompt += (
+            "\n\nA reference text is provided below. Base the questions on its "
+            "content wherever relevant to the topic. If it is unrelated to the "
+            "topic, ignore it and use your own knowledge. For each question, "
+            "fill in source: page 0, line 0, and excerpt is a short verbatim "
+            "quote (under 200 characters) from the reference text that the "
+            "question is based on. If a question is not based on the text, "
+            "use an empty excerpt. Never invent quotes."
+            f'\n\nReference text:\n"""\n{source_text}\n"""'
+        )
+
     try:
         client = get_client()
 
@@ -205,11 +252,16 @@ def handle_generate(environ, start_response):
                 system_instruction="You are a quiz generator API.",
                 temperature=0.2,
                 response_mime_type="application/json",
-                response_schema=list[QuestionWithSource] if file_part else list[Question],
+                response_schema=list[QuestionWithSource]
+                if grounded
+                else list[Question],
             ),
         )
-        
-        questions = [normalize_source(q) for q in json.loads(response.text)]
+
+        questions = [
+            normalize_explanation(normalize_source(q))
+            for q in json.loads(response.text)
+        ]
         return respond(start_response, 200, normalize_categories(questions))
     except Exception as e:
         print("Gemini error:", e)
