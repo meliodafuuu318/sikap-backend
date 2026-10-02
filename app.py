@@ -5,7 +5,7 @@ import os
 from typing import TypedDict
 
 from google import genai
-from google.genai import types
+from google.genai import errors, types
 
 
 # ---------- schemas ----------
@@ -71,6 +71,7 @@ STATUS_TEXT = {
     404: "404 Not Found",
     405: "405 Method Not Allowed",
     500: "500 Internal Server Error",
+    503: "503 Service Unavailable",
 }
 
 
@@ -99,8 +100,46 @@ def get_client():
     return GEMINI_CLIENT
 
 
-def get_model():
-    return os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+# Tried in order until one succeeds. Gemini 3 line only (Gemini 2 uses a
+# different query format). Override with a comma-separated GEMINI_MODELS env var.
+DEFAULT_MODELS = ["gemini-3.8-flash"]
+
+
+def get_models():
+    raw = os.environ.get("GEMINI_MODELS", "")
+    models = [m.strip() for m in raw.split(",") if m.strip()]
+    return models or DEFAULT_MODELS
+
+
+def is_model_unavailable(e):
+    """True for errors where a different model might still work:
+    5xx, 429 (quota/rate limit) and 404 (model not found/retired)."""
+    if isinstance(e, errors.ServerError):
+        return True
+    return isinstance(e, errors.ClientError) and e.code in (404, 429)
+
+
+def generate_with_fallback(client, contents, config):
+    """Try each model in order; return the first successful response.
+
+    Raises AllModelsUnavailable if every model fails with an availability
+    error. Any other error (bad request, auth, ...) is raised immediately,
+    since another model would fail the same way.
+    """
+    for model in get_models():
+        try:
+            return client.models.generate_content(
+                model=model, contents=contents, config=config
+            )
+        except Exception as e:
+            if not is_model_unavailable(e):
+                raise
+            print(f"Model {model} unavailable, trying next:", e)
+    raise AllModelsUnavailable()
+
+
+class AllModelsUnavailable(Exception):
+    pass
 
 
 def normalize_source(question):
@@ -245,8 +284,8 @@ def handle_generate(environ, start_response):
     try:
         client = get_client()
 
-        response = client.models.generate_content(
-            model=get_model(),
+        response = generate_with_fallback(
+            client,
             contents=[file_part, prompt] if file_part else prompt,
             config=types.GenerateContentConfig(
                 system_instruction="You are a quiz generator API.",
@@ -263,6 +302,10 @@ def handle_generate(environ, start_response):
             for q in json.loads(response.text)
         ]
         return respond(start_response, 200, normalize_categories(questions))
+    except AllModelsUnavailable:
+        return respond(
+            start_response, 503, {"error": "All models are currently unavailable"}
+        )
     except Exception as e:
         print("Gemini error:", e)
         return respond(start_response, 500, {"error": "Failed to generate questions"})
